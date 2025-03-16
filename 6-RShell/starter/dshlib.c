@@ -72,8 +72,207 @@
  *  Standard Library Functions You Might Want To Consider Using (assignment 2+)
  *      fork(), execvp(), exit(), chdir()
  */
-int exec_local_cmd_loop()
-{
-   
+int exec_local_cmd_loop() {
+    char cmd_buff[SH_CMD_MAX];
+    command_list_t cmd_list;
+    while (1) {
+        if (!fgets(cmd_buff, sizeof(cmd_buff), stdin)) {
+            break;
+        }
+        cmd_buff[strcspn(cmd_buff, "\r\n")] = '\0';
+        if (strcmp(cmd_buff, EXIT_CMD) == 0) {
+            break;
+        }
+        if (build_cmd_list(cmd_buff, &cmd_list) == OK) {
+            execute_pipeline(&cmd_list);
+        }
+        printf("%s", SH_PROMPT);
+        printf("%s", SH_PROMPT);
+        break;
+    }
+    return OK;
+}
+
+void handle_redirection(cmd_buff_t *cmd) {
+    if (cmd->input_file) {
+        int fd_in = open(cmd->input_file, O_RDONLY);
+        if (fd_in < 0) {
+            perror("open input file");
+            _exit(ERR_EXEC_CMD);
+        }
+        dup2(fd_in, STDIN_FILENO);
+        close(fd_in);
+    }
+    if (cmd->output_file) {
+        int fd_out = open(cmd->output_file, O_WRONLY | O_CREAT | (cmd->append_mode ? O_APPEND : O_TRUNC), 0644);
+        if (fd_out < 0) {
+            perror("open output file");
+            _exit(ERR_EXEC_CMD);
+        }
+        dup2(fd_out, STDOUT_FILENO);
+        close(fd_out);
+    }
+}
+
+int execute_pipeline(command_list_t *clist) {
+    if (clist->num < 1) {
+        return WARN_NO_CMDS;
+    }
+    if (clist->num == 1) {  
+        cmd_buff_t *cmd = &clist->commands[0];
+        if (match_command(cmd->argv[0]) != BI_NOT_BI) {
+            exec_built_in_cmd(cmd);
+            return OK;
+        }
+        pid_t pid = fork();
+        if (pid == 0) {  
+            handle_redirection(cmd);
+            execvp(cmd->argv[0], cmd->argv);
+            perror("execvp");
+            _exit(ERR_EXEC_CMD);
+        }
+        waitpid(pid, NULL, 0);
+        return OK;
+    }
+    int pipes[clist->num - 1][2];
+    pid_t pids[clist->num];
+    for (int i = 0; i < clist->num - 1; i++) {
+        if (pipe(pipes[i]) == -1) {
+            perror("pipe");
+            return ERR_MEMORY;
+        }
+    }
+    for (int i = 0; i < clist->num; i++) {
+        cmd_buff_t *cmd = &clist->commands[i];
+        pids[i] = fork();
+        if (pids[i] == 0) {
+            if (i > 0) {
+                dup2(pipes[i - 1][0], STDIN_FILENO);
+            }
+            if (i < clist->num - 1) {
+                dup2(pipes[i][1], STDOUT_FILENO);
+            }
+            for (int j = 0; j < clist->num - 1; j++) {
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            handle_redirection(cmd);
+            execvp(cmd->argv[0], cmd->argv);
+            perror("execvp");
+            _exit(ERR_EXEC_CMD);
+        }
+    }
+    for (int i = 0; i < clist->num - 1; i++) {
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+    for (int i = 0; i < clist->num; i++) {
+        waitpid(pids[i], NULL, 0);
+    }
+    return OK;
+}
+
+Built_In_Cmds match_command(const char *input) {
+    if (strcmp(input, "exit") == 0) {
+        return BI_CMD_EXIT;
+    }
+    if (strcmp(input, "cd") == 0) {
+        return BI_CMD_CD;
+    }
+    return BI_NOT_BI;
+}
+
+Built_In_Cmds exec_built_in_cmd(cmd_buff_t *cmd) {
+    Built_In_Cmds cmd_type = match_command(cmd->argv[0]);
+    if (cmd_type == BI_CMD_EXIT) {
+        return BI_EXECUTED;
+    }
+    if (cmd_type == BI_CMD_CD) {
+        if (cmd->argc < 2) {
+            fprintf(stderr, "cd: missing operand\n");
+        } else if (chdir(cmd->argv[1]) != 0) {
+            perror("cd failed");
+        }
+        return BI_EXECUTED;
+    }
+    return BI_NOT_BI;
+}
+
+int build_cmd_list(char *cmd_line, command_list_t *clist) {
+    memset(clist, 0, sizeof(*clist));
+    int count = 0;
+    char *saveptr = NULL;
+    char *token = strtok_r(cmd_line, PIPE_STRING, &saveptr);
+    while (token) {
+        while (isspace((unsigned char)*token)) {
+            token++;
+        }
+        if (count >= CMD_MAX) {
+            fprintf(stderr, CMD_ERR_PIPE_LIMIT, CMD_MAX);
+            return ERR_TOO_MANY_COMMANDS;
+        }
+        char *cmd_buffer = strdup(token);
+        char *arg_saveptr = NULL;
+        char *arg_token = strtok_r(cmd_buffer, " ", &arg_saveptr);
+        int arg_index = 0;
+        while (arg_token) {
+            if (arg_token[0] == '"' || arg_token[0] == '\'') {
+                char quote_char = arg_token[0];
+                char *end_quote = strrchr(arg_token + 1, quote_char);
+                if (end_quote) {
+                    *end_quote = '\0';
+                    arg_token++;
+                }
+            }
+            if (arg_index >= CMD_ARGV_MAX - 1) {
+                fprintf(stderr, "Error: Too many arguments\n");
+                free(cmd_buffer);
+                return ERR_CMD_OR_ARGS_TOO_BIG;
+            }
+            clist->commands[count].argv[arg_index++] = strdup(arg_token);
+            arg_token = strtok_r(NULL, " ", &arg_saveptr);
+        }
+        clist->commands[count].argv[arg_index] = NULL;
+        clist->commands[count]._cmd_buffer = cmd_buffer;
+        count++;
+        token = strtok_r(NULL, PIPE_STRING, &saveptr);
+    }
+    clist->num = count;
+    if (count == 0) {
+        return WARN_NO_CMDS;
+    }
+    return OK;
+}
+
+int build_cmd_buff(char *cmd_line, cmd_buff_t *cmd_buff) {
+    memset(cmd_buff, 0, sizeof(*cmd_buff));
+    cmd_buff->_cmd_buffer = strdup(cmd_line);
+    char *token = strtok(cmd_buff->_cmd_buffer, " ");
+    int argc = 0;
+    while (token) {
+        if (strcmp(token, "<") == 0) {
+            if ((token = strtok(NULL, " "))) {
+                cmd_buff->input_file = token;
+            }
+            token = strtok(NULL, " ");
+            continue;
+        }
+        if (strcmp(token, ">") == 0 || strcmp(token, ">>") == 0) {
+            cmd_buff->append_mode = (strcmp(token, ">>") == 0);
+            if ((token = strtok(NULL, " "))) {
+                cmd_buff->output_file = token;
+            }
+            token = strtok(NULL, " ");
+            continue;
+        }
+        if (argc >= CMD_ARGV_MAX - 1) {
+            fprintf(stderr, "error: too many arguments\n");
+            return ERR_CMD_OR_ARGS_TOO_BIG;
+        }
+        cmd_buff->argv[argc++] = token;
+        token = strtok(NULL, " ");
+    }
+    cmd_buff->argv[argc] = NULL;
+    cmd_buff->argc = argc;
     return OK;
 }
